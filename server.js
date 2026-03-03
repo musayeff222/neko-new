@@ -25,8 +25,9 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+  // Verilənlər bazası hovuzu (Pool)
   const pool = mysql.createPool({
-    host: process.env.DB_HOST,
+    host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
@@ -38,175 +39,138 @@ async function startServer() {
 
   const initDB = async () => {
     try {
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS messages (
+      // Bağlantını yoxlayırıq
+      await pool.getConnection();
+      
+      const tables = [
+        `CREATE TABLE IF NOT EXISTS messages (
           id INT AUTO_INCREMENT PRIMARY KEY,
           question TEXT,
           answer TEXT,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS products (
+        )`,
+        `CREATE TABLE IF NOT EXISTS products (
           id VARCHAR(100) PRIMARY KEY,
           content LONGTEXT,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS sales (
+        )`,
+        `CREATE TABLE IF NOT EXISTS sales (
           id VARCHAR(100) PRIMARY KEY,
           content LONGTEXT,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS customers (
+        )`,
+        `CREATE TABLE IF NOT EXISTS customers (
           id VARCHAR(100) PRIMARY KEY,
           content LONGTEXT,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS scraps (
+        )`,
+        `CREATE TABLE IF NOT EXISTS scraps (
           id VARCHAR(100) PRIMARY KEY,
           content LONGTEXT,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
-      await pool.execute(`
-        CREATE TABLE IF NOT EXISTS settings (
+        )`,
+        `CREATE TABLE IF NOT EXISTS settings (
           id VARCHAR(50) PRIMARY KEY,
           content LONGTEXT,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
-      console.log('Database tables initialized');
+        )`
+      ];
+
+      for (const query of tables) {
+        await pool.execute(query);
+      }
+      console.log('✅ Database tables initialized');
     } catch (err) {
-      console.error('Database initialization failed:', err);
+      console.error('❌ Database initialization failed:', err.message);
+      // Bazaya qoşula bilməsə belə serverin çökməməsi üçün prosesi dayandırmırıq
     }
   };
+
   await initDB();
 
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+  const ai = new GoogleGenAI(process.env.GEMINI_API_KEY || '');
+  // Qeyd: Model adı rəsmi stabil versiya ilə əvəzləndi
+  const genAIModel = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
 
   app.post('/api/chat', async (req, res) => {
     const { message } = req.body;
-
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
-    }
+    if (!message) return res.status(400).json({ error: 'Message is required' });
 
     try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: message,
-        config: {
-          systemInstruction:
-            'Sən NEKO GOLD zərgərlik mağazasının süni intellekt köməkçisisən. Müştərilərə zərgərlik məmulatları, qızılın qiyməti, məhsul növləri (üzük, sırğa, boyunbağı və s.) haqqında məlumat verirsən. Cavabların qısa, peşəkar və mehriban olmalıdır. Azərbaycan dilində danışırsan.',
-        },
+      const result = await genAIModel.generateContent({
+        contents: [{ role: 'user', parts: [{ text: message }] }],
+        systemInstruction: 'Sən NEKO GOLD zərgərlik mağazasının süni intellekt köməkçisisən. Müştərilərə zərgərlik məmulatları haqqında məlumat verirsən. Azərbaycan dilində danışırsan.',
       });
 
-      const aiResponse = response.text || 'Üzr istəyirik, hazırda cavab verə bilmirəm.';
+      const aiResponse = result.response.text();
 
       try {
-        const sql = 'INSERT INTO messages (question, answer) VALUES (?, ?)';
-        await pool.execute(sql, [message, aiResponse]);
+        await pool.execute('INSERT INTO messages (question, answer) VALUES (?, ?)', [message, aiResponse]);
       } catch (dbErr) {
-        console.warn('Database logging failed, but AI responded:', dbErr);
+        console.warn('DB Log error:', dbErr.message);
       }
 
-      res.json({
-        question: message,
-        answer: aiResponse,
-        status: 'success',
-      });
+      res.json({ question: message, answer: aiResponse, status: 'success' });
     } catch (error) {
-      console.error('Error in /api/chat:', error);
+      console.error('AI Error:', error);
       res.status(500).json({ error: 'Internal Server Error' });
     }
   });
 
-  app.get('/api/data/:type', async (req, res) => {
-    const type = req.params.type;
-    const allowedTypes = ['products', 'sales', 'customers', 'scraps', 'settings'];
+  // API Data Routes
+  const allowedTypes = ['products', 'sales', 'customers', 'scraps', 'settings'];
 
-    if (!allowedTypes.includes(type)) {
-      return res.status(400).json({ error: 'Invalid data type' });
-    }
+  app.get('/api/data/:type', async (req, res) => {
+    const { type } = req.params;
+    if (!allowedTypes.includes(type)) return res.status(400).json({ error: 'Invalid type' });
 
     try {
       const [rows] = await pool.execute(`SELECT content FROM ${type}`);
       const data = rows.map((row) => JSON.parse(row.content));
-
-      if (type === 'settings') {
-        res.json(data[0] || null);
-      } else {
-        res.json(data);
-      }
+      res.json(type === 'settings' ? (data[0] || null) : data);
     } catch (error) {
-      console.error(`Failed to fetch ${type}:`, error);
       res.status(500).json({ error: 'Failed to fetch data' });
     }
   });
 
   app.post('/api/data/:type', async (req, res) => {
-    const type = req.params.type;
+    const { type } = req.params;
     const { data } = req.body;
-    const allowedTypes = ['products', 'sales', 'customers', 'scraps', 'settings'];
-
-    if (!allowedTypes.includes(type)) {
-      return res.status(400).json({ error: 'Invalid data type' });
-    }
+    if (!allowedTypes.includes(type)) return res.status(400).json({ error: 'Invalid type' });
 
     try {
-      console.log(`Syncing ${type} with ${Array.isArray(data) ? data.length : 'single'} items`);
-
       if (type === 'settings') {
         const content = JSON.stringify(data);
         await pool.execute(
           `INSERT INTO settings (id, content) VALUES ('current', ?) ON DUPLICATE KEY UPDATE content = ?`,
-          [content, content],
+          [content, content]
         );
       } else if (Array.isArray(data)) {
         const connection = await pool.getConnection();
         await connection.beginTransaction();
         try {
           await connection.execute(`DELETE FROM ${type}`);
-
           if (data.length > 0) {
-            const values = data.map((item) => [
-              item.id || Math.random().toString(36).substr(2, 9),
-              JSON.stringify(item),
-            ]);
-
-            const sql = `INSERT INTO ${type} (id, content) VALUES ?`;
-            await connection.query(sql, [values]);
+            const values = data.map(item => [item.id || Math.random().toString(36).substr(2, 9), JSON.stringify(item)]);
+            await connection.query(`INSERT INTO ${type} (id, content) VALUES ?`, [values]);
           }
-
           await connection.commit();
-          console.log(`Successfully committed ${data.length} items to ${type}`);
         } catch (err) {
           await connection.rollback();
-          console.error(`Transaction failed for ${type}:`, err);
           throw err;
         } finally {
           connection.release();
         }
       }
-
-      console.log(`Successfully synced ${type}`);
       res.json({ status: 'success' });
     } catch (error) {
-      console.error(`Failed to save ${type} data:`, error);
       res.status(500).json({ error: 'Failed to save data' });
     }
   });
 
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', database: 'connected' });
-  });
+  app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
+  // --- PRODUCTION VƏ VITE AYARLARI ---
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -214,20 +178,22 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
+    const distPath = path.join(__dirname, 'dist');
+    app.use(express.static(distPath));
 
-    app.get('*', (req, res, next) => {
-      if (req.path.startsWith('/api')) return next();
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+    // Bütün digər GET sorğularını index.html-ə yönləndiririk (SPA üçün)
+    // Yeni Express versiyalarında (.*) formatı tələb olunur
+    app.get('(.*)', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
   });
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start server:', err);
+  console.error('💥 Fatal Server Error:', err);
 });
 
