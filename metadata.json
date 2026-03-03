@@ -1,0 +1,7 @@
+{
+  "name": "nekogold",
+  "description": "Premium qızıl rəngli interfeysə malik satış prosesi, stok izləmə, borc idarəetməsi, qızıl qırıntıları uçotu və ətraflı maliyyə hesabatlarını təmin edən hərtərəfli zərgərlik idarəetmə və POS sistemi.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
